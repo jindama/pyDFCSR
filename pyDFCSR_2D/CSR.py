@@ -4,24 +4,71 @@ from bmadx import  Drift, SBend, Quadrupole, Sextupole
 from .tools import dict2hdf5
 import h5py
 import numpy as np
+import torch
 from mpi4py import MPI
 
 from .beams import Beam
-# from .deposit import histogram_cic_1d, histogram_cic_2d
 from .deposit import DF_tracker
+from .interfaces import to_numpy
 from .interp1D import interpolate1D
 from .interp3D import interpolate3D
-from .lattice import Lattice  # , get_referece_traj
+from .torch_interp import interpolate1d_torch, interpolate3d_torch, interpolate3d_multi_torch, interpolate1d_multi_torch
+from .lattice import Lattice
 from .params import Integration_params, CSR_params
-# from .physical_constants import c, e, qe, me, MC2
 from .r_gen6 import r_gen6
-#from line_profiler_pycharm import profile
-# from .tools import (find_nearest_ind, full_path, isotime, plot_2D_contour,
-#                     plot_surface)
 from .tools import full_path, isotime
 from .twiss_R import twiss_R
 from .yaml_parser import parse_yaml
 
+
+
+@torch.compile
+def _csr_integrand_math(r_x, r_y, xp_flat, rho_sp,
+                        tau_s_x, tau_s_y, n_s_x, n_s_y, vx_obs_e,
+                        tau_sp_x, tau_sp_y, n_sp_x, n_sp_y,
+                        density_ret, density_x_ret, density_z_ret, vx_ret, vx_x_ret):
+    """Pure arithmetic portion of the CSR integrand. Compiled to fuse element-wise kernels."""
+    r = torch.sqrt(r_x ** 2 + r_y ** 2)
+    scale = 1 + xp_flat * rho_sp
+
+    vel_x = tau_s_x + vx_obs_e * n_s_x
+    vel_y = tau_s_y + vx_obs_e * n_s_y
+    vel_ret_x = tau_sp_x + vx_ret * n_sp_x
+    vel_ret_y = tau_sp_y + vx_ret * n_sp_y
+
+    nabla_rho_x = density_x_ret * n_sp_x + density_z_ret / scale * tau_sp_x
+    nabla_rho_y = density_x_ret * n_sp_y + density_z_ret / scale * tau_sp_y
+
+    dot_v_vr = vel_x * vel_ret_x + vel_y * vel_ret_y
+    num1 = scale * ((vel_x - dot_v_vr * vel_ret_x) * nabla_rho_x +
+                     (vel_y - dot_v_vr * vel_ret_y) * nabla_rho_y)
+    num2 = -scale * dot_v_vr * density_ret * vx_x_ret
+    iz = (num1 + num2) / r
+
+    dn_x = n_s_x - n_sp_x
+    dn_y = n_s_y - n_sp_y
+    dot_dr_dn = r_x * dn_x + r_y * dn_y
+    dot_n_tau = n_s_x * tau_sp_x + n_s_y * tau_sp_y
+
+    partial_density = -(vel_ret_x * nabla_rho_x + vel_ret_y * nabla_rho_y) - density_ret * vx_x_ret
+
+    W1 = scale * dot_dr_dn / (r ** 3) * density_ret
+    W2 = scale * dot_dr_dn / (r ** 2) * partial_density
+    W3 = -scale * dot_n_tau / r * partial_density
+    ix = W1 + W2 + W3
+
+    return iz, ix
+
+
+def _batched_trapz2d(integrand, xp_1d, sp_1d):
+    """Double trapezoid rule: ∫∫ f(xp, sp) dxp dsp for a batch of observers.
+    integrand: (N, N_xp, N_sp), xp_1d: (N, N_xp), sp_1d: (N, N_sp) → (N,)"""
+    dxp = torch.diff(xp_1d, dim=1)
+    mid_xp = (integrand[:, :-1, :] + integrand[:, 1:, :]) / 2
+    inner = (mid_xp * dxp.unsqueeze(-1)).sum(dim=1)
+    dsp = torch.diff(sp_1d, dim=1)
+    mid_sp = (inner[:, :-1] + inner[:, 1:]) / 2
+    return (mid_sp * dsp).sum(dim=1)
 
 
 class CSR2D:
@@ -29,8 +76,10 @@ class CSR2D:
     The main class to calculate 2D CSR
     """
 
-    def __init__(self, input_file=None, parallel = False):
+    def __init__(self, input_file=None, parallel = False, device='cpu'):
 
+        self.device = device
+        self.use_torch = (device != 'cpu')
         self.timestamp = isotime()
         if input_file:
             self.parse_input(input_file)
@@ -49,13 +98,13 @@ class CSR2D:
         input = parse_yaml(input_file)
         self.check_input_consistency(input)
         self.input = input
-        self.beam = Beam(input['input_beam'])
-        self.lattice = Lattice(input['input_lattice'])
+        self.beam = Beam(input['input_beam'], device=self.device)
+        self.lattice = Lattice(input['input_lattice'], device=self.device)
 
         if 'particle_deposition' in input:
-            self.DF_tracker = DF_tracker(input['particle_deposition'])
+            self.DF_tracker = DF_tracker(input['particle_deposition'], device=self.device)
         else:
-            self.DF_tracker = DF_tracker()
+            self.DF_tracker = DF_tracker(device=self.device)
 
         if 'CSR_integration' in input:
             self.integration_params = Integration_params(input['CSR_integration'])
@@ -138,6 +187,7 @@ class CSR2D:
             assert req in input, f'Required input parameter {req} to {self.__class__.__name__}.__init__(**kwargs) was not found.'
 
     def get_formation_length(self, R, sigma_z, phi = 0.0, inbend=True):
+        sigma_z = self._to_float(sigma_z)
         if inbend:
             self.formation_length = (24 * (R ** 2) * sigma_z) ** (1 / 3)
         else:
@@ -295,36 +345,21 @@ class CSR2D:
 
 
                 if debug or self.CSR_params.compute_CSR:
-                    # get the density functions
                     self.DF_tracker.get_DF(x=self.beam.x, z=self.beam.z, px=self.beam.px, t=self.beam.position)
-                    # append the density functions to the log
                     self.DF_tracker.append_DF()
-                    # append 3D matrix for interpolation with the new DFs by interpolation
-                    #self.get_formation_length(R=R, sigma_z=self.beam.sigma_z)
                     self.DF_tracker.append_interpolant(formation_length=self.formation_length,
                                                        n_formation_length=self.integration_params.n_formation_length)
-                    # build interpolant based on the 3D matrix
                     self.DF_tracker.build_interpolant()
 
-                # If beam is in an after-bend drift and away from the previous bend for more than n*formation_length, stop calculating wakes
-                #Todo: formation length not correct here
-                #if  self.afterbend and (not self.inbend) and distance_in_current_ele > 3*self.formation_length:
-                #    CSR_blocker = True
-                #    if (not self.parallel) or (self.rank == 0):
-                #        print("Far away from a bending magnet, stopping calculating CSR")
-
-                #else:
-                #    CSR_blocker = False
-                CSR_blocker = False
-                
-                
-                if self.CSR_params.compute_CSR and (not CSR_blocker):
+                if self.CSR_params.compute_CSR:
                     if step % self.lattice.nsep[ele_count] == 0:
                         # calculate CSR mesh given beam shape
                         self.get_CSR_mesh()
                         # Calculate CSR on the mesh
                         if self.parallel:
                             self.calculate_2D_CSR_parallel()
+                        elif self.use_torch:
+                            self.calculate_2D_CSR_torch()
                         else:
                             self.calculate_2D_CSR()
                         # Apply CSR kick to the beam
@@ -364,14 +399,16 @@ class CSR2D:
         (xmesh, zmesh) TWO 1D arrays representiong (x, z) coordinates on a linear transformed mesh
         :return:
         """
+        if self.use_torch:
+            return self._get_CSR_mesh_torch()
 
-        x_transform = self.beam.x_transform
-        p = self.beam.slope
+        x_transform = to_numpy(self.beam.x_transform)
+        p = to_numpy(self.beam.slope)
 
         sig_x = np.std(x_transform)
         mean_x = np.mean(x_transform)
-        sig_z = self.beam.sigma_z
-        mean_z = self.beam.mean_z
+        sig_z = self._to_float(self.beam.sigma_z)
+        mean_z = self._to_float(self.beam.mean_z)
         xlim = self.CSR_params.xlim
         zlim = self.CSR_params.zlim
         xbins = self.CSR_params.xbins
@@ -387,6 +424,34 @@ class CSR2D:
         zmesh = zmesh.flatten()
 
         xmesh = xmesh_transform +  np.polyval(p, zmesh)
+
+        self.CSR_xmesh = xmesh
+        self.CSR_zmesh = zmesh
+        self.CSR_zrange = zrange
+        self.CSR_xrange_transformed = xrange
+
+    def _get_CSR_mesh_torch(self):
+        device = self.device
+        x_transform = self.beam.x_transform
+        p = self.beam.slope
+
+        sig_x = torch.std(x_transform, correction=0).item()
+        mean_x = x_transform.mean().item()
+        sig_z = self._to_float(self.beam.sigma_z)
+        mean_z = self._to_float(self.beam.mean_z)
+        xlim = self.CSR_params.xlim
+        zlim = self.CSR_params.zlim
+        xbins = self.CSR_params.xbins
+        zbins = self.CSR_params.zbins
+
+        zrange = torch.linspace(mean_z - zlim * sig_z, mean_z + zlim * sig_z, zbins, device=device, dtype=torch.float64)
+        xrange = torch.linspace(mean_x - xlim * sig_x, mean_x + xlim * sig_x, xbins, device=device, dtype=torch.float64)
+
+        xmesh_transform, zmesh = torch.meshgrid(xrange, zrange, indexing='ij')
+        xmesh_transform = xmesh_transform.flatten()
+        zmesh = zmesh.flatten()
+
+        xmesh = xmesh_transform + p[0] * zmesh + p[1]
 
         self.CSR_xmesh = xmesh
         self.CSR_zmesh = zmesh
@@ -450,94 +515,278 @@ class CSR2D:
         self.dE_dct = self.dE_dct.reshape((self.CSR_params.xbins, self.CSR_params.zbins))
         self.x_kick = self.x_kick.reshape((self.CSR_params.xbins, self.CSR_params.zbins))
 
-#    @profile
-    def get_CSR_wake(self, s, x, debug = False):
+    def calculate_2D_CSR_torch(self):
+        """GPU-batched CSR wake calculation. All N observation points processed simultaneously."""
+        device = self.device
+        N = self.CSR_params.xbins * self.CSR_params.zbins
 
+        s_obs = self.beam.position + self.CSR_zmesh
+        x_obs = self.CSR_xmesh
         t = self.beam.position
 
-        #if t >= 0.5:
-        #    print('')
+        sigma_z = self.beam._sigma_z
+        sigma_x = self.beam._sigma_x
+        tan_theta = self.beam._slope[0]
+        xmean = self.beam._mean_x
+
+        x0 = (s_obs - t) * tan_theta
+
+        n_fl = self.integration_params.n_formation_length
+        fl = self.formation_length
+        zbins_int = self.integration_params.zbins
+        xbins_int = self.integration_params.xbins
+
+        t01_z = torch.linspace(0, 1, zbins_int, device=device, dtype=torch.float64)
+        t01_x = torch.linspace(0, 1, xbins_int, device=device, dtype=torch.float64)
+        t01_x2 = torch.linspace(0, 1, 2 * xbins_int, device=device, dtype=torch.float64)
+
+        self._prepare_csr_tensors()
+
+        dE_dct = torch.zeros(N, device=device, dtype=torch.float64)
+        x_kick = torch.zeros(N, device=device, dtype=torch.float64)
+
+        chirp_band = abs(tan_theta) > 1
+
+        if not chirp_band:
+            s2 = s_obs - 500 * sigma_z
+            s3 = s_obs - 20 * sigma_z
+            s4 = s_obs + 5 * sigma_z
+            s1 = torch.clamp(s2 - n_fl * fl, min=0)
+
+            x1_w = x0 - 20 * sigma_x
+            x2_w = x0 + 20 * sigma_x
+            x1_n = x0 - 10 * sigma_x
+            x2_n = x0 + 10 * sigma_x
+
+            sp1 = s1.unsqueeze(1) + (s2 - s1).unsqueeze(1) * t01_z
+            sp2 = s2.unsqueeze(1) + (s3 - s2).unsqueeze(1) * t01_z
+            sp3 = s3.unsqueeze(1) + (s4 - s3).unsqueeze(1) * t01_z
+            xp_w = x1_w.unsqueeze(1) + (x2_w - x1_w).unsqueeze(1) * t01_x2
+            xp_n = x1_n.unsqueeze(1) + (x2_n - x1_n).unsqueeze(1) * t01_x
+
+            regions = [(xp_w, sp1), (xp_n, sp2), (xp_n, sp3)]
+        else:
+            if tan_theta > 0:
+                tan_alpha = -2 * tan_theta / (1 - tan_theta ** 2)
+                d = (10 * sigma_x + xmean - x_obs) / tan_alpha
+            else:
+                tan_alpha = 2 * tan_theta / (1 - tan_theta ** 2)
+                d = -(xmean - x_obs - 10 * sigma_x) / tan_alpha
+
+            s4 = s_obs + 3 * sigma_z
+            s3 = torch.clamp(s_obs - d, min=0)
+            s2 = s3 - 200 * sigma_z
+            s1 = torch.clamp(s2 - n_fl * fl, min=0)
+
+            if tan_theta > 0:
+                x1_l = x_obs + 0.1 * sigma_x
+                x1_r = x_obs + 10 * sigma_x
+                x2_l = x_obs - 3 * sigma_x
+                x2_r = x1_l
+            else:
+                x1_l = x_obs - 10 * sigma_x
+                x1_r = x_obs - 1 * sigma_x
+                x2_l = x1_r
+                x2_r = x_obs + 3 * sigma_x
+
+            x3_l = x0 - 5 * sigma_x
+            x3_r = x0 + 5 * sigma_x
+            x4_l = x0 - 20 * sigma_x
+            x4_r = x0 + 20 * sigma_x
+
+            sp1 = s1.unsqueeze(1) + (s2 - s1).unsqueeze(1) * t01_z
+            sp2 = s2.unsqueeze(1) + (s3 - s2).unsqueeze(1) * t01_z
+            sp3 = s3.unsqueeze(1) + (s4 - s3).unsqueeze(1) * t01_z
+            xp1 = x1_l.unsqueeze(1) + (x1_r - x1_l).unsqueeze(1) * t01_x
+            xp2 = x2_l.unsqueeze(1) + (x2_r - x2_l).unsqueeze(1) * t01_x
+            xp3 = x3_l.unsqueeze(1) + (x3_r - x3_l).unsqueeze(1) * t01_x
+            xp4 = x4_l.unsqueeze(1) + (x4_r - x4_l).unsqueeze(1) * t01_x2
+
+            regions = [(xp4, sp1), (xp3, sp2), (xp1, sp3), (xp2, sp3)]
+
+        for xp_1d, sp_1d in regions:
+            iz, ix = self._get_CSR_integrand_batched(s_obs, x_obs, t, xp_1d, sp_1d)
+            dE_dct += -self.CSR_scaling * _batched_trapz2d(iz, xp_1d, sp_1d)
+            x_kick += self.CSR_scaling * _batched_trapz2d(ix, xp_1d, sp_1d)
+
+        self.dE_dct = dE_dct.cpu().numpy().reshape((self.CSR_params.xbins, self.CSR_params.zbins))
+        self.x_kick = x_kick.cpu().numpy().reshape((self.CSR_params.xbins, self.CSR_params.zbins))
+
+    def _prepare_csr_tensors(self):
+        """Reference DF tracker tensors (already on GPU from build_interpolant) and lattice data."""
+        df = self.DF_tracker
+        self._df_density_t = df.data_density_interp
+        self._df_density_x_t = df.data_density_x_interp
+        self._df_density_z_t = df.data_density_z_interp
+        self._df_vx_t = df.data_vx_interp
+        self._df_vx_x_t = df.data_vx_x_interp
+        if not hasattr(self, '_distance_t'):
+            device = self.device
+            self._distance_t = torch.tensor(self.lattice.distance, device=device, dtype=torch.float64)
+            self._rho_t = torch.tensor(self.lattice.rho, device=device, dtype=torch.float64)
+
+    def _get_CSR_integrand_batched(self, s_obs, x_obs, t, xp_1d, sp_1d):
+        """
+        Batched CSR integrand for all observers simultaneously.
+        s_obs, x_obs: (N,)
+        xp_1d: (N, N_xp) — per-observer source x coordinates
+        sp_1d: (N, N_sp) — per-observer source s coordinates
+        Returns (iz, ix) each (N, N_xp, N_sp)
+        """
+        device = self.device
+        N = s_obs.shape[0]
+        N_xp = xp_1d.shape[1]
+        N_sp = sp_1d.shape[1]
+        M = N_xp * N_sp
+
+        # Build per-observer meshgrids and flatten source dims
+        xp_flat = xp_1d.unsqueeze(2).expand(N, N_xp, N_sp).reshape(N, M)
+        sp_flat = sp_1d.unsqueeze(1).expand(N, N_xp, N_sp).reshape(N, M)
+
+        # Fully flatten for interpolation calls
+        xp_ff = xp_flat.reshape(-1)
+        sp_ff = sp_flat.reshape(-1)
+
+        # --- Observer quantities (N,) ---
+
+        t_obs = torch.full((N,), t, device=device, dtype=torch.float64)
+        vx_obs = interpolate3d_torch(
+            xval=t_obs, yval=x_obs, zval=s_obs - t,
+            data=self._df_vx_t,
+            min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y,
+            min_z=self.DF_tracker.min_z, delta_x=self.DF_tracker.delta_x,
+            delta_y=self.DF_tracker.delta_y, delta_z=self.DF_tracker.delta_z)
+
+        lat_min_x = self.lattice.min_x
+        lat_delta_x = self.lattice.delta_x
+        coords_x = self.lattice.coords_t[:, 0]
+        coords_y = self.lattice.coords_t[:, 1]
+        nvec_x = self.lattice.n_vec_t[:, 0]
+        nvec_y = self.lattice.n_vec_t[:, 1]
+        tvec_x = self.lattice.tau_vec_t[:, 0]
+        tvec_y = self.lattice.tau_vec_t[:, 1]
+
+        # Fused observer geometry: 6 lookups at s_obs, indices computed once
+        X0_s, Y0_s, n_s_x, n_s_y, tau_s_x, tau_s_y = interpolate1d_multi_torch(
+            s_obs, [coords_x, coords_y, nvec_x, nvec_y, tvec_x, tvec_y], lat_min_x, lat_delta_x)
+
+        # Fused source geometry: 6 lookups at sp_ff, indices computed once
+        X0_sp, Y0_sp, n_sp_x, n_sp_y, tau_sp_x, tau_sp_y = interpolate1d_multi_torch(
+            sp_ff, [coords_x, coords_y, nvec_x, nvec_y, tvec_x, tvec_y], lat_min_x, lat_delta_x)
+        X0_sp = X0_sp.reshape(N, M)
+        Y0_sp = Y0_sp.reshape(N, M)
+        n_sp_x = n_sp_x.reshape(N, M)
+        n_sp_y = n_sp_y.reshape(N, M)
+        tau_sp_x = tau_sp_x.reshape(N, M)
+        tau_sp_y = tau_sp_y.reshape(N, M)
+
+        # Expand observer quantities for broadcasting: (N,) → (N, 1)
+        X0_s = X0_s.unsqueeze(1)
+        Y0_s = Y0_s.unsqueeze(1)
+        n_s_x = n_s_x.unsqueeze(1)
+        n_s_y = n_s_y.unsqueeze(1)
+        tau_s_x = tau_s_x.unsqueeze(1)
+        tau_s_y = tau_s_y.unsqueeze(1)
+        x_obs_e = x_obs.unsqueeze(1)
+        vx_obs_e = vx_obs.unsqueeze(1)
+
+        # Separation vector: (N, M)
+        r_x = X0_s - X0_sp + x_obs_e * n_s_x - xp_flat * n_sp_x
+        r_y = Y0_s - Y0_sp + x_obs_e * n_s_y - xp_flat * n_sp_y
+
+        # Curvature at source points: (N, M)
+        rho_sp = self._rho_t[torch.searchsorted(self._distance_t, sp_flat).clamp(0, len(self._rho_t) - 1)]
+
+        # Retarded-time: need r for t_ret, then DF lookups
+        r = torch.sqrt(r_x ** 2 + r_y ** 2)
+        t_ret = t - r
+        t_ret_ff = t_ret.reshape(-1)
+        xp_ff2 = xp_flat.reshape(-1)
+        z_ret_ff = (sp_flat - t_ret).reshape(-1)
+
+        df_min_x = self.DF_tracker.min_x
+        df_min_y = self.DF_tracker.min_y
+        df_min_z = self.DF_tracker.min_z
+        df_dx = self.DF_tracker.delta_x
+        df_dy = self.DF_tracker.delta_y
+        df_dz = self.DF_tracker.delta_z
+
+        # Fused DF lookups: 5 fields at same (t_ret, xp, z_ret), indices computed once
+        density_ret, density_x_ret, density_z_ret, vx_ret, vx_x_ret = interpolate3d_multi_torch(
+            t_ret_ff, xp_ff2, z_ret_ff,
+            [self._df_density_t, self._df_density_x_t, self._df_density_z_t,
+             self._df_vx_t, self._df_vx_x_t],
+            df_min_x, df_min_y, df_min_z, df_dx, df_dy, df_dz)
+        density_ret = density_ret.reshape(N, M)
+        density_x_ret = density_x_ret.reshape(N, M)
+        density_z_ret = density_z_ret.reshape(N, M)
+        vx_ret = vx_ret.reshape(N, M)
+        vx_x_ret = vx_x_ret.reshape(N, M)
+
+        # Compiled arithmetic: fuses ~40 element-wise kernels
+        iz, ix = _csr_integrand_math(
+            r_x, r_y, xp_flat, rho_sp,
+            tau_s_x, tau_s_y, n_s_x, n_s_y, vx_obs_e,
+            tau_sp_x, tau_sp_y, n_sp_x, n_sp_y,
+            density_ret, density_x_ret, density_z_ret, vx_ret, vx_x_ret)
+
+        return iz.reshape(N, N_xp, N_sp), ix.reshape(N, N_xp, N_sp)
+
+    def get_CSR_wake(self, s, x):
+
+        t = self.beam.position
 
         sigma_z = self.beam._sigma_z
         sigma_x = self.beam._sigma_x
         tan_theta = self.beam._slope[0]
 
-        #TODO： why?
         x0 = (s-t)*self.beam._slope[0]
         xmean = self.beam._mean_x
 
-        
-        ######### For Debug ########################################################## 
-        if np.abs(tan_theta) <= 1:  # if theta <45 degre, the chirp band can be ignored. theta is the angle in z-x plane
-            ignore_vx = False
-        else:
-            ignore_vx = False
-
-        ############################################################################
-
         chirp_band = False
 
-        if np.abs(tan_theta) <= 1:  # if chirp is small, the chirp band can be ignored. theta is the angle in z-x plane
+        if np.abs(tan_theta) <= 1:
+            # Small chirp: use wide/narrow x-ranges for far/near s-regions
             s2 = s - 500 * sigma_z
             s3 = s - 20*sigma_z
             s4 = s + 5 * sigma_z
             x1_w = x0 - 20 * sigma_x
             x2_w = x0 + 20 * sigma_x
-
             x1_n = x0 - 10 * sigma_x
             x2_n = x0 + 10 * sigma_x
 
         else:
+            # Large chirp: split x-range into separate regions around observer and chirp center
             chirp_band = True
             if tan_theta > 0:
-                tan_alpha = -2 * tan_theta / (1 - tan_theta ** 2)  # alpha = pi - 2 theta, tan_alpha > 0
+                tan_alpha = -2 * tan_theta / (1 - tan_theta ** 2)
                 d = (10 * sigma_x + xmean - x) / tan_alpha
-                
-                s4 = s + 3 * sigma_z
-                s3 = np.max((0, s - d))
-                s2 = s3 - 200 * sigma_z
-
-                # area 1
-                x1_l = x + 0.1 * sigma_x
-                x1_r = x + 10 * sigma_x
-        
-                # area 2
-                x2_l = x - 3 * sigma_x
-                x2_r = x1_l
-
-                # area 3
-                x3_l = x0 - 5 * sigma_x
-                x3_r = x0 + 5 * sigma_x
-
-                x4_l = x0 - 20 * sigma_x
-                x4_r = x0 + 20 * sigma_x
-
-
             else:
                 tan_alpha = 2 * tan_theta / (1 - tan_theta ** 2)
                 d = -(xmean - x - 10 * sigma_x) / tan_alpha
-                
-                s4 = s + 3 * sigma_z
-                s3 = np.max((0, s - d))
-                s2 = s3 - 200 * sigma_z
 
-                # area 1
+            s4 = s + 3 * sigma_z
+            s3 = np.max((0, s - d))
+            s2 = s3 - 200 * sigma_z
+
+            if tan_theta > 0:
+                x1_l = x + 0.1 * sigma_x
+                x1_r = x + 10 * sigma_x
+                x2_l = x - 3 * sigma_x
+                x2_r = x1_l
+            else:
                 x1_l = x - 10 * sigma_x
                 x1_r = x - 1 * sigma_x
-                
-                # area 2
                 x2_l = x1_r
-                x2_r = x + 3 *sigma_x
-  
-                # area 3
-                x3_l = x0 - 5 * sigma_x
-                x3_r = x0 + 5 * sigma_x
+                x2_r = x + 3 * sigma_x
 
-                x4_l = x0 - 20 * sigma_x
-                x4_r = x0 + 20 * sigma_x
-        
+            x3_l = x0 - 5 * sigma_x
+            x3_r = x0 + 5 * sigma_x
+            x4_l = x0 - 20 * sigma_x
+            x4_r = x0 + 20 * sigma_x
+
         s1 = np.max((0, s2 - self.integration_params.n_formation_length * self.formation_length))
-       
+
         if chirp_band:
             sp1 = np.linspace(s1, s2, self.integration_params.zbins)
             sp2 = np.linspace(s2, s3, self.integration_params.zbins)
@@ -547,31 +796,16 @@ class CSR2D:
             xp3 = np.linspace(x3_l, x3_r, self.integration_params.xbins)
             xp4 = np.linspace(x4_l, x4_r, 2*self.integration_params.xbins)
 
-            [xp_mesh1, sp_mesh1] = np.meshgrid(xp4, sp1, indexing='ij')
-            [xp_mesh2, sp_mesh2] = np.meshgrid(xp3, sp2, indexing = 'ij')
-            [xp_mesh3, sp_mesh3] = np.meshgrid(xp1, sp3, indexing='ij')
-            [xp_mesh4, sp_mesh4] = np.meshgrid(xp2, sp3, indexing='ij')
-
-            CSR_integrand_z1, CSR_integrand_x1 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh1, sp=sp_mesh1, ignore_vx = ignore_vx)
-            dE_dct1 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z1, x=xp4, axis=0), x=sp1)
-            x_kick1 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x1, x=xp4, axis=0), x=sp1)
-
-            CSR_integrand_z2, CSR_integrand_x2 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh2, sp=sp_mesh2, ignore_vx = ignore_vx)
-            dE_dct2 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z2, x=xp3, axis=0), x=sp2)
-            x_kick2 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x2, x=xp3, axis=0), x=sp2)
-
-            CSR_integrand_z3, CSR_integrand_x3 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh3, sp=sp_mesh3, ignore_vx = ignore_vx)
-            dE_dct3 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z3, x=xp1, axis=0), x=sp3)
-            x_kick3 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x3, x=xp1, axis=0), x=sp3)
-
-            CSR_integrand_z4, CSR_integrand_x4 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh4, sp=sp_mesh4, ignore_vx = ignore_vx)
-            dE_dct4 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z4, x=xp2, axis=0), x=sp3)
-            x_kick4 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x4, x=xp2, axis=0), x=sp3)
-
-            if debug:
-                return xp1, xp2, xp3, xp4, sp1, sp2, sp3,  CSR_integrand_z1, CSR_integrand_x1, CSR_integrand_z2, CSR_integrand_x2, CSR_integrand_z3, CSR_integrand_x3, CSR_integrand_z4, CSR_integrand_x4
-            else:
-                return dE_dct1 + dE_dct2 + dE_dct3 + dE_dct4, x_kick1 + x_kick2 + x_kick3 + x_kick4
+            # 4 sub-regions: (xp4,sp1), (xp3,sp2), (xp1,sp3), (xp2,sp3)
+            regions = [(xp4, sp1), (xp3, sp2), (xp1, sp3), (xp2, sp3)]
+            dE_dct_total = 0.0
+            x_kick_total = 0.0
+            for xp_1d, sp_1d in regions:
+                xp_mesh, sp_mesh = np.meshgrid(xp_1d, sp_1d, indexing='ij')
+                iz, ix = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh, sp=sp_mesh)
+                dE_dct_total += -self.CSR_scaling * np.trapz(y=np.trapz(y=iz, x=xp_1d, axis=0), x=sp_1d)
+                x_kick_total += self.CSR_scaling * np.trapz(y=np.trapz(y=ix, x=xp_1d, axis=0), x=sp_1d)
+            return dE_dct_total, x_kick_total
 
         else:
             sp1 = np.linspace(s1, s2, self.integration_params.zbins)
@@ -580,31 +814,24 @@ class CSR2D:
             xp_w = np.linspace(x1_w, x2_w, 2*self.integration_params.xbins)
             xp_n = np.linspace(x1_n, x2_n, self.integration_params.xbins)
 
-            [xp_mesh1, sp_mesh1] = np.meshgrid(xp_w, sp1, indexing='ij')
-            [xp_mesh2, sp_mesh2] = np.meshgrid(xp_n, sp2, indexing='ij')
-            [xp_mesh3, sp_mesh3] = np.meshgrid(xp_n, sp3, indexing='ij')
-
-            CSR_integrand_z1, CSR_integrand_x1 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh1, sp=sp_mesh1, ignore_vx = ignore_vx)
-            dE_dct1 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z1, x=xp_w, axis=0), x=sp1)
-            x_kick1 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x1, x=xp_w, axis=0), x=sp1)
-
-            CSR_integrand_z2, CSR_integrand_x2 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh2, sp=sp_mesh2, ignore_vx = ignore_vx)
-            dE_dct2 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z2, x=xp_n, axis=0), x=sp2)
-            x_kick2 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x2, x=xp_n, axis=0), x=sp2)
-
-            CSR_integrand_z3, CSR_integrand_x3 = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh3, sp=sp_mesh3, ignore_vx = ignore_vx)
-            dE_dct3 = -self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_z3, x=xp_n, axis=0), x=sp3)
-            x_kick3 = self.CSR_scaling * np.trapz(y=np.trapz(y=CSR_integrand_x3, x=xp_n, axis=0), x=sp3)
-            
-            if debug:
-                return xp_w, xp_n,  sp1, sp2, sp3, CSR_integrand_z1, CSR_integrand_x1,CSR_integrand_z2, CSR_integrand_x2,CSR_integrand_z3, CSR_integrand_x3
-            else:
-                return dE_dct1 + dE_dct2 + dE_dct3, x_kick1 + x_kick2 + x_kick3
+            # 3 sub-regions: wide x for far s, narrow x for near s
+            regions = [(xp_w, sp1), (xp_n, sp2), (xp_n, sp3)]
+            dE_dct_total = 0.0
+            x_kick_total = 0.0
+            for xp_1d, sp_1d in regions:
+                xp_mesh, sp_mesh = np.meshgrid(xp_1d, sp_1d, indexing='ij')
+                iz, ix = self.get_CSR_integrand(s=s, t=t, x=x, xp=xp_mesh, sp=sp_mesh)
+                dE_dct_total += -self.CSR_scaling * np.trapz(y=np.trapz(y=iz, x=xp_1d, axis=0), x=sp_1d)
+                x_kick_total += self.CSR_scaling * np.trapz(y=np.trapz(y=ix, x=xp_1d, axis=0), x=sp_1d)
+            return dE_dct_total, x_kick_total
           
           
-    def get_CSR_integrand(self,s ,x, t, sp, xp, ignore_vx = False):
+    def get_CSR_integrand(self, s, x, t, sp, xp):
 
-        #vx = self.DF_tracker.F_vx([t, x, s - t])
+        sp_flat = sp.ravel()
+        xp_flat = xp.ravel()
+
+        # Observer velocity (transverse component at observation point)
         vx = interpolate3D(xval=np.array([t]), yval=np.array([x]), zval=np.array([s-t]),
                              data=self.DF_tracker.data_vx_interp,
                              min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y,
@@ -612,42 +839,40 @@ class CSR2D:
                              delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y,
                              delta_z=self.DF_tracker.delta_z)[0]
 
-        sp_flat = sp.ravel()
-        xp_flat = xp.ravel()
-
-
-        X0_s = interpolate1D(xval = np.array([s]), data = self.lattice.coords[:, 0], min_x = self.lattice.min_x,
-                             delta_x = self.lattice.delta_x)[0]
-        X0_sp = interpolate1D(xval = sp_flat, data = self.lattice.coords[:, 0], min_x = self.lattice.min_x,
-                              delta_x = self.lattice.delta_x)
-        Y0_s = interpolate1D(xval = np.array([s]), data = self.lattice.coords[:, 1], min_x = self.lattice.min_x,
-                             delta_x = self.lattice.delta_x)[0]
-        Y0_sp = interpolate1D(xval = sp_flat, data = self.lattice.coords[:, 1], min_x = self.lattice.min_x,
-                              delta_x = self.lattice.delta_x)
-        n_vec_s_x = interpolate1D(xval = np.array([s]), data = self.lattice.n_vec[:, 0], min_x = self.lattice.min_x,
-                                  delta_x = self.lattice.delta_x)[0]
-        n_vec_sp_x =interpolate1D(xval = sp_flat, data = self.lattice.n_vec[:, 0], min_x = self.lattice.min_x,
-                                  delta_x = self.lattice.delta_x)
+        # Lattice geometry at observer point s (scalars)
+        X0_s = interpolate1D(xval=np.array([s]), data=self.lattice.coords[:, 0], min_x=self.lattice.min_x,
+                             delta_x=self.lattice.delta_x)[0]
+        Y0_s = interpolate1D(xval=np.array([s]), data=self.lattice.coords[:, 1], min_x=self.lattice.min_x,
+                             delta_x=self.lattice.delta_x)[0]
+        n_vec_s_x = interpolate1D(xval=np.array([s]), data=self.lattice.n_vec[:, 0], min_x=self.lattice.min_x,
+                                  delta_x=self.lattice.delta_x)[0]
         n_vec_s_y = interpolate1D(xval=np.array([s]), data=self.lattice.n_vec[:, 1], min_x=self.lattice.min_x,
                                   delta_x=self.lattice.delta_x)[0]
+        tau_vec_s_x = interpolate1D(xval=np.array([s]), data=self.lattice.tau_vec[:, 0], min_x=self.lattice.min_x,
+                                    delta_x=self.lattice.delta_x)[0]
+        tau_vec_s_y = interpolate1D(xval=np.array([s]), data=self.lattice.tau_vec[:, 1], min_x=self.lattice.min_x,
+                                    delta_x=self.lattice.delta_x)[0]
+
+        # Lattice geometry at source points sp (arrays)
+        X0_sp = interpolate1D(xval=sp_flat, data=self.lattice.coords[:, 0], min_x=self.lattice.min_x,
+                              delta_x=self.lattice.delta_x)
+        Y0_sp = interpolate1D(xval=sp_flat, data=self.lattice.coords[:, 1], min_x=self.lattice.min_x,
+                              delta_x=self.lattice.delta_x)
+        n_vec_sp_x = interpolate1D(xval=sp_flat, data=self.lattice.n_vec[:, 0], min_x=self.lattice.min_x,
+                                   delta_x=self.lattice.delta_x)
         n_vec_sp_y = interpolate1D(xval=sp_flat, data=self.lattice.n_vec[:, 1], min_x=self.lattice.min_x,
                                    delta_x=self.lattice.delta_x)
-        tau_vec_s_x = interpolate1D(xval=np.array([s]), data=self.lattice.tau_vec[:, 0], min_x=self.lattice.min_x,
-                                  delta_x=self.lattice.delta_x)[0]
         tau_vec_sp_x = interpolate1D(xval=sp_flat, data=self.lattice.tau_vec[:, 0], min_x=self.lattice.min_x,
-                                   delta_x=self.lattice.delta_x)
-        tau_vec_s_y = interpolate1D(xval=np.array([s]), data=self.lattice.tau_vec[:, 1], min_x=self.lattice.min_x,
-                                  delta_x=self.lattice.delta_x)[0]
+                                     delta_x=self.lattice.delta_x)
         tau_vec_sp_y = interpolate1D(xval=sp_flat, data=self.lattice.tau_vec[:, 1], min_x=self.lattice.min_x,
-                                   delta_x=self.lattice.delta_x)
+                                     delta_x=self.lattice.delta_x)
 
-
+        # Separation vector r - r'
         r_minus_rp_x = X0_s - X0_sp + x * n_vec_s_x - xp_flat * n_vec_sp_x
         r_minus_rp_y = Y0_s - Y0_sp + x * n_vec_s_y - xp_flat * n_vec_sp_y
         r_minus_rp = np.sqrt(r_minus_rp_x**2 + r_minus_rp_y**2)
 
-
-        #rho_sp = self.lattice.F_rho(sp_flat)
+        # Curvature at source points (piecewise constant per element)
         rho_sp = np.zeros(sp_flat.shape)
         for count in range(self.lattice.Nelement):
             if count == 0:
@@ -655,129 +880,69 @@ class CSR2D:
             else:
                 rho_sp[(sp_flat < self.lattice.distance[count]) & (sp_flat >= self.lattice.distance[count - 1])] = self.lattice.rho[count]
 
+        # Retarded-time distribution function lookups
         t_ret = t - r_minus_rp
 
-        #density_ret = self.DF_tracker.F_density(np.array([t_ret, xp_flat, sp_flat - t_ret]).T)
-        #density_x_ret = self.DF_tracker.F_density_x(np.array([t_ret, xp_flat, sp_flat- t_ret]).T)
-        #density_z_ret = self.DF_tracker.F_density_z(np.array([t_ret, xp_flat, sp_flat- t_ret]).T)
-        #vx_ret = self.DF_tracker.F_vx(np.array([t_ret, xp_flat, sp_flat- t_ret]).T)
-        #vx_x_ret = self.DF_tracker.F_vx_x(np.array([t_ret, xp_flat, sp_flat- t_ret]).T)
-
-        density_ret = interpolate3D(xval = t_ret, yval = xp_flat, zval = sp_flat - t_ret,
-                                  data = self.DF_tracker.data_density_interp,
-                                  min_x = self.DF_tracker.min_x, min_y = self.DF_tracker.min_y,  min_z = self.DF_tracker.min_z,
-                                  delta_x = self.DF_tracker.delta_x, delta_y = self.DF_tracker.delta_y, delta_z = self.DF_tracker.delta_z)
+        density_ret = interpolate3D(xval=t_ret, yval=xp_flat, zval=sp_flat - t_ret,
+                                    data=self.DF_tracker.data_density_interp,
+                                    min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y, min_z=self.DF_tracker.min_z,
+                                    delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y, delta_z=self.DF_tracker.delta_z)
 
         density_x_ret = interpolate3D(xval=t_ret, yval=xp_flat, zval=sp_flat - t_ret,
-                                  data=self.DF_tracker.data_density_x_interp,
-                                  min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y, min_z=self.DF_tracker.min_z,
-                                  delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y,
-                                  delta_z=self.DF_tracker.delta_z)
+                                      data=self.DF_tracker.data_density_x_interp,
+                                      min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y, min_z=self.DF_tracker.min_z,
+                                      delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y, delta_z=self.DF_tracker.delta_z)
 
         density_z_ret = interpolate3D(xval=t_ret, yval=xp_flat, zval=sp_flat - t_ret,
-                                    data=self.DF_tracker.data_density_z_interp,
-                                    min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y,
-                                    min_z=self.DF_tracker.min_z,
-                                    delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y,
-                                    delta_z=self.DF_tracker.delta_z)
+                                      data=self.DF_tracker.data_density_z_interp,
+                                      min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y, min_z=self.DF_tracker.min_z,
+                                      delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y, delta_z=self.DF_tracker.delta_z)
 
         vx_ret = interpolate3D(xval=t_ret, yval=xp_flat, zval=sp_flat - t_ret,
-                                    data=self.DF_tracker.data_vx_interp,
-                                    min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y,
-                                    min_z=self.DF_tracker.min_z,
-                                    delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y,
-                                    delta_z=self.DF_tracker.delta_z)
+                               data=self.DF_tracker.data_vx_interp,
+                               min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y, min_z=self.DF_tracker.min_z,
+                               delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y, delta_z=self.DF_tracker.delta_z)
 
         vx_x_ret = interpolate3D(xval=t_ret, yval=xp_flat, zval=sp_flat - t_ret,
-                             data=self.DF_tracker.data_vx_x_interp,
-                             min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y,
-                             min_z=self.DF_tracker.min_z,
-                             delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y,
-                             delta_z=self.DF_tracker.delta_z)
+                                 data=self.DF_tracker.data_vx_x_interp,
+                                 min_x=self.DF_tracker.min_x, min_y=self.DF_tracker.min_y, min_z=self.DF_tracker.min_z,
+                                 delta_x=self.DF_tracker.delta_x, delta_y=self.DF_tracker.delta_y, delta_z=self.DF_tracker.delta_z)
 
-        ## Todo: More accurate vx, maybe add vs
-        vs = 1
-        vs_ret = 1
-        vs_s_ret = 0
-        vx_t = 0
-        vs_t = 0
-        #vx = 0
-        #vx_x_ret = 0
-        #vx_ret = 0
+        # Simplified velocity model: vs=1, vs_s_ret=0 (no time derivatives)
+        scale_term = 1 + xp_flat * rho_sp
 
-        if ignore_vx:
-            vx = 0
-            vx_x_ret = 0
-            vx_ret = 0
+        velocity_x = tau_vec_s_x + vx * n_vec_s_x
+        velocity_y = tau_vec_s_y + vx * n_vec_s_y
 
-        scale_term =  1 + xp_flat*rho_sp
+        velocity_ret_x = tau_vec_sp_x + vx_ret * n_vec_sp_x
+        velocity_ret_y = tau_vec_sp_y + vx_ret * n_vec_sp_y
 
-
-        velocity_x = vs * tau_vec_s_x + vx * n_vec_s_x
-        velocity_y = vs * tau_vec_s_y + vx * n_vec_s_y
-
-        velocity_ret_x = vs_ret * tau_vec_sp_x + vx_ret * n_vec_sp_x
-        velocity_ret_y = vs_ret * tau_vec_sp_y + vx_ret * n_vec_sp_y
-
-        #velocity_partial_t_x = vs_t * tau_vec_sp_x + vx_t * n_vec_sp_x
-        #velocity_partial_t_y = vs_t * tau_vec_sp_y + vx_t * n_vec_sp_y
-
-        nabla_density_ret_x = density_x_ret  * n_vec_sp_x + density_z_ret / scale_term * tau_vec_sp_x
+        nabla_density_ret_x = density_x_ret * n_vec_sp_x + density_z_ret / scale_term * tau_vec_sp_x
         nabla_density_ret_y = density_x_ret * n_vec_sp_y + density_z_ret / scale_term * tau_vec_sp_y
 
-        div_velocity = vs_s_ret + vx_x_ret  #???
+        # Longitudinal CSR integrand
+        dot_v_vret = velocity_x * velocity_ret_x + velocity_y * velocity_ret_y
+        CSR_num1 = scale_term * ((velocity_x - dot_v_vret * velocity_ret_x) * nabla_density_ret_x +
+                                 (velocity_y - dot_v_vret * velocity_ret_y) * nabla_density_ret_y)
+        CSR_num2 = -scale_term * dot_v_vret * density_ret * vx_x_ret
+        CSR_integrand_z = (CSR_num1 + CSR_num2) / r_minus_rp
 
-        # Todo: Consider using general form
-        ## general form
-        part1 = velocity_x * velocity_ret_x + velocity_y * velocity_ret_y
-        CSR_numerator1 = scale_term * ((velocity_x - part1 * velocity_ret_x) * nabla_density_ret_x  + \
-                          (velocity_y - part1 * velocity_ret_y)*nabla_density_ret_y)
-        CSR_numerator2 = -scale_term * part1 * density_ret * div_velocity
-        #CSR_numerator3 = scale_term * density_ret * (velocity_partial_t_x * velocity_x + velocity_partial_t_y * velocity_y)
-
-        #CSR_denominator = r_minus_rp
-
-        #self.CSR_integrand = CSR_numerator1/CSR_denominator + (CSR_numerator2 + CSR_numerator3)/CSR_denominator
-        CSR_integrand_z = CSR_numerator1 /r_minus_rp + (CSR_numerator2) / r_minus_rp
-
-
-
-        #CSR_numerator1 = scale_term * (((n_vec_sp_x * tau_vec_s_x + n_vec_sp_y * tau_vec_s_y) +
-        #                                (vx - vx_ret) * (tau_vec_sp_x * tau_vec_s_x + tau_vec_sp_y * tau_vec_s_y)) * density_x_ret -
-        #                               vx_ret * (n_vec_sp_x * tau_vec_s_x + n_vec_sp_y * tau_vec_s_y)/scale_term * density_z_ret)
-
-        #CSR_numerator2 = -((tau_vec_sp_x * tau_vec_s_x + tau_vec_sp_y * tau_vec_s_y) +
-        #                   (vx - vx_ret) * (n_vec_s_x * tau_vec_sp_x + n_vec_s_y * tau_vec_sp_y)) * density_ret * vx_x_ret
-
-        #CSR_numerator3 = scale_term * density_ret * (velocity_partial_t_x * velocity_x + velocity_partial_t_y * velocity_y)
-
-        #CSR_denominator = r_minus_rp
-
-        #CSR_integrand_z = CSR_numerator1/CSR_denominator + (CSR_numerator2 + CSR_numerator3)/CSR_denominator
-
+        # Transverse CSR integrand
         n_minus_np_x = n_vec_s_x - n_vec_sp_x
         n_minus_np_y = n_vec_s_y - n_vec_sp_y
 
-        #part: (r-r')(n - n')
-        part1 = r_minus_rp_x * n_minus_np_x + r_minus_rp_y * n_minus_np_y
+        dot_dr_dn = r_minus_rp_x * n_minus_np_x + r_minus_rp_y * n_minus_np_y
+        dot_n_tau = n_vec_s_x * tau_vec_sp_x + n_vec_s_y * tau_vec_sp_y
 
-        #part2: n tau'
-        part2 = n_vec_s_x * tau_vec_sp_x + n_vec_s_y * tau_vec_sp_y
+        partial_density = -(velocity_ret_x * nabla_density_ret_x + velocity_ret_y * nabla_density_ret_y) - \
+                          density_ret * vx_x_ret
 
-        # part3: partial density/partial t_ret
-        partial_density = - (velocity_ret_x * nabla_density_ret_x + velocity_ret_y * nabla_density_ret_y) - \
-                          density_ret * div_velocity
+        W1 = scale_term * dot_dr_dn / (r_minus_rp ** 3) * density_ret
+        W2 = scale_term * dot_dr_dn / (r_minus_rp ** 2) * partial_density
+        W3 = -scale_term * dot_n_tau / r_minus_rp * partial_density
 
-        W1 = scale_term * part1 / (r_minus_rp * r_minus_rp * r_minus_rp) * density_ret
-        W2 = scale_term * part1 / (r_minus_rp * r_minus_rp) * partial_density
-        W3 = -scale_term * part2 / r_minus_rp * partial_density
-
-        CSR_integrand_x = W1 + W2 + W3
-        #CSR_integrand_x = W1
-        CSR_integrand_x = CSR_integrand_x.reshape(xp.shape)
+        CSR_integrand_x = (W1 + W2 + W3).reshape(xp.shape)
         CSR_integrand_z = CSR_integrand_z.reshape(xp.shape)
-
-
 
         return CSR_integrand_z, CSR_integrand_x
 
@@ -825,15 +990,23 @@ class CSR2D:
             g.attrs['charge'] = self.beam.charge
             g1 = g.create_group('longitudinal')
             g1.attrs['unit'] = 'MeV/m'
-            g1.create_dataset('x_grids', data = self.CSR_xmesh.reshape(self.dE_dct.shape))
-            g1.create_dataset('z_grids', data = self.CSR_zmesh.reshape(self.dE_dct.shape))
-            g1.create_dataset('dE_dct', data = self.dE_dct)
+            xmesh_np = to_numpy(self.CSR_xmesh.reshape(self.dE_dct.shape))
+            zmesh_np = to_numpy(self.CSR_zmesh.reshape(self.dE_dct.shape))
+            g1.create_dataset('x_grids', data = xmesh_np)
+            g1.create_dataset('z_grids', data = zmesh_np)
+            g1.create_dataset('dE_dct', data = to_numpy(self.dE_dct))
             g2  = g.create_group('transverse')
             g2.attrs['unit'] = 'MeV/m'
-            g2.create_dataset('x_grids', data = self.CSR_xmesh.reshape(self.dE_dct.shape))
-            g2.create_dataset('z_grids', data = self.CSR_zmesh.reshape(self.dE_dct.shape))
-            g2.create_dataset('xkicks', data = self.x_kick)
+            g2.create_dataset('x_grids', data = xmesh_np)
+            g2.create_dataset('z_grids', data = zmesh_np)
+            g2.create_dataset('xkicks', data = to_numpy(self.x_kick))
 #    @profile
+    def _to_float(self, val):
+        """Extract a Python float from a torch tensor or numpy scalar."""
+        if isinstance(val, torch.Tensor):
+            return val.item()
+        return float(val)
+
     def update_statistics(self, step):
         twiss = self.beam.twiss
         self.statistics['twiss']['alpha_x'][step] = twiss['alpha_x']
@@ -853,10 +1026,10 @@ class CSR2D:
         self.statistics['slope'][step, :] = self.beam._slope
         self.statistics['sigma_x'][step] = self.beam._sigma_x
         self.statistics['sigma_z'][step] = self.beam._sigma_z
-        self.statistics['sigma_energy'][step] = self.beam.sigma_energy
+        self.statistics['sigma_energy'][step] = self._to_float(self.beam.sigma_energy)
         self.statistics['mean_x'][step] = self.beam._mean_x
         self.statistics['mean_z'][step] = self.beam._mean_z
-        self.statistics['mean_energy'][step] = self.beam.mean_energy
+        self.statistics['mean_energy'][step] = self._to_float(self.beam.mean_energy)
     def write_statistics(self):
 
         if self.parallel and self.rank != 0:

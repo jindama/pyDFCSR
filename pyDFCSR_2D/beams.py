@@ -1,20 +1,42 @@
 import numpy as np
+import torch
 from distgen import Generator
 from .physical_constants import MC2
 from scipy.interpolate import RegularGridInterpolator
 from bmadx import Particle, M_ELECTRON
-#from bmadx.pmd_utils import openpmd_to_bmadx_particles, bmadx_particles_to_openpmd
-from .interfaces import  openpmd_to_bmadx_particles, bmadx_particles_to_openpmd
+from .interfaces import openpmd_to_bmadx_particles, bmadx_particles_to_openpmd
+from .interfaces import to_numpy, to_torch
 from bmadx import track_element
 from pmd_beamphysics import ParticleGroup
-#from line_profiler_pycharm import profile
-from .twiss import  twiss_from_bmadx_particles
+from .twiss import twiss_from_bmadx_particles
+
+
+def _polyfit1_torch(z, x):
+    """Degree-1 polyfit: returns [slope, intercept] matching np.polyfit convention."""
+    n = z.shape[0]
+    z_mean = z.mean()
+    x_mean = x.mean()
+    slope = ((z - z_mean) * (x - x_mean)).sum() / ((z - z_mean) ** 2).sum()
+    intercept = x_mean - slope * z_mean
+    return torch.stack([slope, intercept])
+
+
+def _polyval1_torch(p, z):
+    """Evaluate degree-1 polynomial p = [slope, intercept] at z."""
+    return p[0] * z + p[1]
+
+
+def _std_torch(x):
+    return torch.std(x, correction=0)
+
+
 class Beam():
     """
     Beam class to initialize, track and apply wakes
     """
-    def __init__(self, input_beam):
+    def __init__(self, input_beam, device='cpu'):
 
+        self.device = device
         self.check_inputs(input_beam)
         self.input_beam_config = input_beam
         self.style = input_beam['style']
@@ -29,13 +51,13 @@ class Beam():
             self._charge = input_beam['charge']
             self._init_energy = input_beam['energy']
 
-            # Keep track of both BmadX particle format (for tracking) and Particle Group format (for calculating twiss).
-            self.particle = Particle(*coords.T, 0, self._init_energy, MC2)   #BmadX Particle
-            #self.particleGroup = bmadx_particles_to_openpmd(self.particle)  # Particle Group
+            if device == 'cpu':
+                self.particle = Particle(*coords.T, 0, self._init_energy, MC2)
+            else:
+                coords_t = to_torch(coords, device=device)
+                self.particle = Particle(*coords_t.T, 0, self._init_energy, MC2)
 
-
-
-        elif  self.style == 'distgen':
+        elif self.style == 'distgen':
             filename = input_beam['distgen_input_file']
             gen = Generator(filename)
             gen.run()
@@ -43,8 +65,7 @@ class Beam():
             self._charge = pg['charge']
             self._init_energy = np.mean(pg['energy'])
 
-            self.particle = openpmd_to_bmadx_particles(pg, self._init_energy, 0.0, MC2)   #Bmad X particle
-            #self.particleGroup = pg              # Particle Group
+            self.particle = openpmd_to_bmadx_particles(pg, self._init_energy, 0.0, MC2, device=device)
 
         else:
             ParticleGroup_h5 = input_beam['ParticleGroup_h5']
@@ -53,15 +74,13 @@ class Beam():
             self._charge = pg['charge']
             self._init_energy = np.mean(pg['energy'])
 
-            self.particle = openpmd_to_bmadx_particles(pg, self._init_energy, 0.0, MC2)  # Bmad X particle
-            #self.particleGroup = pg  # Particle Group
+            self.particle = openpmd_to_bmadx_particles(pg, self._init_energy, 0.0, MC2, device=device)
 
-            # unchanged, initial energy and gamma
-        self._init_gamma = self._init_energy/MC2
-        #self._n_particle = self.particles.shape[0]
+        self._init_gamma = self._init_energy / MC2
 
         self.position = 0
         self.step = 0
+        self._use_torch = isinstance(self.particle.x, torch.Tensor)
 
         self.update_status()
 
@@ -84,44 +103,66 @@ class Beam():
         # Make sure all required parameters are specified
         for req in self.required_inputs:
             assert req in input_beam, f'Required input parameter {req} to {self.__class__.__name__}.__init__(**kwargs) was not found.'
-#    @profile
-    def update_status(self):
-        #self.particleGroup = bmadx_particles_to_openpmd(self.particle)
-        self._sigma_x = self.sigma_x
-        self._sigma_z = self.sigma_z
-        self._slope = self.slope
-        #self._sigma_x_transform = self.sigma_x_transform
-        self._mean_x = self.mean_x
-        self._mean_z = self.mean_z
-        #self._twiss = self.twiss
-        #self._sigma_energy = self.sigma_energy
-        #self._mean_energy = self.mean_energy
 
- #   @profile
+    def update_status(self):
+        # Cache as plain floats/numpy so CSR code doesn't need torch conversion
+        sx = self.sigma_x
+        sz = self.sigma_z
+        mx = self.mean_x
+        mz = self.mean_z
+        sl = self.slope
+        if self._use_torch:
+            self._sigma_x = sx.item()
+            self._sigma_z = sz.item()
+            self._mean_x = mx.item()
+            self._mean_z = mz.item()
+            self._slope = to_numpy(sl)
+        else:
+            self._sigma_x = sx
+            self._sigma_z = sz
+            self._mean_x = mx
+            self._mean_z = mz
+            self._slope = sl
+
     def track(self, element, step_size, update_step=True):
         self.particle = track_element(self.particle, element)
         self.position += step_size
         if update_step:
             self.step += 1
         self.update_status()
-  #  @profile
-    def apply_wakes(self, dE_dct, x_kick, xrange, zrange, step_size, transverse_on):
-        # Todo: add options for transverse or longitudinal kick only
-        dE_E1 = step_size * dE_dct * 1e6 / self.init_energy  # self.energy in eV
-        interp = RegularGridInterpolator((xrange, zrange), dE_E1, fill_value=0.0, bounds_error=False)
-        dE_Es = interp(np.array([self.x_transform, self.z]).T)
-        #self.particle.pz += dE_Es
-        pz_new = self.particle.pz + dE_Es
 
-        if transverse_on:
-            dxp = step_size * x_kick * 1e6 / self.init_energy
-            interp = RegularGridInterpolator((xrange, zrange), dxp, fill_value=0.0, bounds_error=False)
-            dxps = interp(np.array([self.x_transform, self.z]).T)
-            #self.particle.px += dxps
-            px_new = self.particle.px + dxps
-        
+    def apply_wakes(self, dE_dct, x_kick, xrange, zrange, step_size, transverse_on):
+        dE_E1 = step_size * dE_dct * 1e6 / self.init_energy
+        if self._use_torch:
+            from .torch_interp import interpolate2d_bilinear_torch
+            # CSR arrays may be numpy — convert to torch on the right device
+            dE_E1_t = to_torch(dE_E1, device=self.device)
+            xrange_t = to_torch(xrange, device=self.device)
+            zrange_t = to_torch(zrange, device=self.device)
+            x_t = self.x_transform
+            z_t = self.z
+            dE_Es = interpolate2d_bilinear_torch(x_t, z_t, dE_E1_t, xrange_t, zrange_t)
+            pz_new = self.particle.pz + dE_Es
+
+            if transverse_on:
+                dxp = step_size * x_kick * 1e6 / self.init_energy
+                dxp_t = to_torch(dxp, device=self.device)
+                dxps = interpolate2d_bilinear_torch(x_t, z_t, dxp_t, xrange_t, zrange_t)
+                px_new = self.particle.px + dxps
+            else:
+                px_new = self.particle.px
         else:
-            px_new = self.particle.px
+            interp = RegularGridInterpolator((xrange, zrange), dE_E1, fill_value=0.0, bounds_error=False)
+            dE_Es = interp(np.array([self.x_transform, self.z]).T)
+            pz_new = self.particle.pz + dE_Es
+
+            if transverse_on:
+                dxp = step_size * x_kick * 1e6 / self.init_energy
+                interp = RegularGridInterpolator((xrange, zrange), dxp, fill_value=0.0, bounds_error=False)
+                dxps = interp(np.array([self.x_transform, self.z]).T)
+                px_new = self.particle.px + dxps
+            else:
+                px_new = self.particle.px
 
         self.particle = Particle(self.particle.x, px_new,
                                  self.particle.y, self.particle.py,
@@ -136,25 +177,33 @@ class Beam():
 
     @property
     def mean_x(self):
+        if self._use_torch:
+            return self.particle.x.mean()
         return np.mean(self.particle.x)
 
     @property
     def mean_y(self):
+        if self._use_torch:
+            return self.particle.y.mean()
         return np.mean(self.particle.y)
 
     @property
     def sigma_x(self):
+        if self._use_torch:
+            return _std_torch(self.particle.x)
         return np.std(self.particle.x)
-
 
     @property
     def sigma_z(self):
+        if self._use_torch:
+            return _std_torch(self.particle.z)
         return np.std(self.particle.z)
 
     @property
     def mean_z(self):
+        if self._use_torch:
+            return self.particle.z.mean()
         return np.mean(self.particle.z)
-
 
     @property
     def init_energy(self):
@@ -164,20 +213,24 @@ class Beam():
     def init_gamma(self):
         return self._init_gamma
 
-
     @property
     def energy(self):
-        return (self.particle.pz+1)*self.particle.p0c
+        return (self.particle.pz + 1) * self.particle.p0c
+
     @property
     def mean_energy(self):
+        if self._use_torch:
+            return self.energy.mean()
         return np.mean(self.energy)
 
     @property
     def gamma(self):
-        return self.energy/MC2
+        return self.energy / MC2
 
     @property
     def sigma_energy(self):
+        if self._use_torch:
+            return _std_torch(self.energy)
         return np.std(self.energy)
 
     @property
@@ -196,24 +249,24 @@ class Beam():
     def pz(self):
         return self.particle.pz
 
-
-
     @property
     def slope(self):
-        p = np.polyfit(self.z, self.x, deg=1)
-        return p
+        if self._use_torch:
+            return _polyfit1_torch(self.z, self.x)
+        return np.polyfit(self.z, self.x, deg=1)
 
     @property
     def x_transform(self):
-        """
-        :return: x coordinates after removing the x-z chirp
-        """
+        """x coordinates after removing the x-z chirp"""
+        if self._use_torch:
+            return self.x - _polyval1_torch(self.slope, self.z)
         return self.x - np.polyval(self.slope, self.z)
 
     @property
     def sigma_x_transform(self):
+        if self._use_torch:
+            return _std_torch(self.x_transform)
         return np.std(self.x_transform)
-
 
     @property
     def charge(self):
@@ -226,5 +279,4 @@ class Beam():
     @property
     def particle_group(self):
         pg = bmadx_particles_to_openpmd(self.particle, self.charge)
-        #pg.weight = np.abs(pg.weight)
         return pg

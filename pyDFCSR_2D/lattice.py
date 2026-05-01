@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from .yaml_parser import parse_yaml
 
 def get_referece_traj(lattice_config, Nsample = 5000, Ndim = 2):
@@ -115,8 +116,9 @@ class Lattice():
     maybe install a pointer for the position of the current beam
     """
 
-    def __init__(self, input_lattice):
+    def __init__(self, input_lattice, device='cpu'):
 
+        self.device = device
         assert 'lattice_input_file' in input_lattice, 'Error in parsing lattice: must include the keyword <lattice_input_file>'
         self.lattice_input_file = input_lattice['lattice_input_file']
 
@@ -141,13 +143,10 @@ class Lattice():
     def build_interpolant(self):
         self.min_x, self.max_x = self.s[0], self.s[-1]
         self.delta_x = (self.max_x - self.min_x) / (self.s.shape[0] - 1)
-        #self.F_x_ref = RegularGridInterpolator(points=(self.s,), values=self.coords[:, 0], method='linear',bounds_error = False)
-        #self.F_y_ref = RegularGridInterpolator(points=(self.s,), values=self.coords[:, 1], method='linear',bounds_error = False)
-        #self.F_n_vec_x = RegularGridInterpolator(points=(self.s,), values=self.n_vec[:, 0], method='linear',bounds_error = False)
-        #self.F_n_vec_y = RegularGridInterpolator(points=(self.s,), values=self.n_vec[:, 1], method='linear',bounds_error = False)
-        #self.F_tau_vec_x = RegularGridInterpolator(points=(self.s,), values=self.tau_vec[:, 0], method='linear',bounds_error = False)
-        #self.F_tau_vec_y = RegularGridInterpolator(points=(self.s,), values=self.tau_vec[:, 1], method='linear',bounds_error = False)
-        #self.F_rho = RegularGridInterpolator(points = (self.s,), values = self.rho, method = 'nearest',bounds_error = False)
+        # Convert arrays to torch tensors for GPU interpolation
+        self.coords_t = torch.tensor(self.coords, dtype=torch.float64, device=self.device)
+        self.n_vec_t = torch.tensor(self.n_vec, dtype=torch.float64, device=self.device)
+        self.tau_vec_t = torch.tensor(self.tau_vec, dtype=torch.float64, device=self.device)
 
     def get_steps(self):
         self.step_size = self.lattice_config['step_size']
