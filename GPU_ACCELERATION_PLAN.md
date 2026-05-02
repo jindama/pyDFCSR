@@ -27,20 +27,38 @@ steps within each element. Each step does:
 5. **Wake application** — Interpolates the 2D wake field onto each particle
    position and updates momenta.
 
-### Profiling summary (where time is spent)
+### Profiling summary (pre-GPU baseline, where time was spent)
 
 Profiled at moderate particle count (~10k). At typical production scale
 (100k–10M particles), per-particle operations (CIC deposition, wake
 interpolation onto particles, beam tracking) become significant and
 must also run on GPU.
 
-| Component | Fraction (10k) | Scales with | Current impl |
+| Component | Fraction (10k) | Scales with | Original impl |
 |-----------|---------------|-------------|-------------|
 | CSR wake calculation (step 4) | ~90% | mesh points (xbins×zbins) | Python for-loop, Numba interp |
 | DF construction (step 2) | ~5% | particles | Numba CIC + scipy savgol |
 | Interpolant assembly (step 3) | ~3% | DF history depth | scipy RegularGridInterpolator |
 | Beam tracking (step 1) | ~1% | particles | Bmad-X (numpy or torch) |
 | Wake application (step 5) | ~1% | particles | scipy RegularGridInterpolator |
+
+### GPU performance results (A100 80GB, CIC deposition)
+
+Full simulation benchmark (single dipole lattice, 11 CSR-active steps):
+
+| Particles | CPU (ms/step) | GPU (ms/step) | Speedup | Peak GPU mem |
+|----------:|--------------:|--------------:|--------:|-------------:|
+| 100k | 289 | 28 | **10x** | 303 MB |
+| 500k | 454 | 30 | **15x** | 384 MB |
+| 1M | 1,027 | 34 | **31x** | 1,255 MB |
+| 5M | 3,929 | 47 | **83x** | 2,051 MB |
+| 10M | 7,435 | 67 | **111x** | 3,050 MB |
+
+GPU time is nearly flat up to ~1M particles (dominated by fixed CSR
+integration cost), then scales sub-linearly with N. CPU time scales
+roughly linearly with N (dominated by per-particle deposition and wake
+application). Memory headroom is ample — 10M particles uses only 3.8%
+of the A100's 80 GB.
 
 ---
 
@@ -286,5 +304,8 @@ Scipy remains for the CPU fallback path only. The GPU path replaces:
 | 2026-05-01 | Phase 3 implemented: (a) GPU CIC histogram via `scatter_add_` in `histogram_cic_2d_torch`. (b) Savitzky-Golay filtering via `conv2d` with precomputed kernel, replacing scipy. (c) Central-difference gradient via torch, replacing `np.gradient`. (d) DF interpolant assembly via `interpolate2d_bilinear_torch`, replacing scipy `RegularGridInterpolator`. (f) GPU Twiss via `_cov3_torch` + `_twiss_dispersion_calc_torch`, eliminating 28 GPU→CPU round-trips. `DF_tracker` now accepts `device` parameter. |
 | 2026-05-01 | Phase 3 validated + benchmarked. CPU vs GPU agreement identical to Phase 2 (same accumulated feedback diffs). 1M particle benchmark: CPU 23.4s → GPU 3.6s = **6.5x speedup**. Simulation loop (`run()`) dropped from 3.1s to 1.5s. Remaining wall time dominated by file I/O (2.07s = 57%). |
 | 2026-05-01 | Phase 4 implemented: (a) `torch.compile` on `_csr_integrand_math` — fuses ~40 element-wise kernels into 2–3 compiled kernels. (b) `interpolate3d_multi_torch` and `interpolate1d_multi_torch` — compute indices once for 5 DF fields (or 6 lattice fields) instead of repeating. (c) `build_interpolant` creates torch tensors directly on GPU; `_prepare_csr_tensors` references them instead of re-creating via `torch.tensor()`. Lattice tensors created once. |
-| 2026-05-01 | Phase 4 benchmarked. 1M particles: CPU 22.6s → GPU 3.3s = **6.9x overall**, simulation loop 1.19s = **~15x compute speedup**. CSR integrand 45% faster (0.35s→0.19s). Diminishing returns — remaining time is genuine computation + I/O. |
+| 2026-05-01 | Phase 4 benchmarked (preliminary, 1M particles with I/O): CPU 22.6s → GPU 3.3s = 6.9x overall including I/O, simulation loop 1.19s = ~15x compute speedup. CSR integrand 45% faster (0.35s→0.19s). Full benchmark (I/O disabled, 100k–10M particles) showed **10–111x speedup** — see performance table above. |
 | 2026-05-01 | Percentile-based grid bounds implemented in `deposit.py`. New `configure_params` options: `grid_mode='sigma'|'percentile'`, `grid_percentile=0.9995`, `grid_padding=0.05`. Default is `'sigma'` (unchanged behavior). Percentile mode uses `np.percentile`/`torch.quantile` for grid bounds, tracks bounds in `x_bounds_log`/`z_bounds_log`, uses union-of-bounds for common interpolation grid with margin. Validated: CPU/GPU agree to same tolerance as sigma mode; percentile grid ~24% tighter than sigma grid. |
+| 2026-05-01 | TSC (Triangular Shaped Cloud) deposition added as optional alternative to CIC. Quadratic spline weights (9 cells/particle in 2D vs CIC's 4) provide continuous first derivatives, reducing numerical noise that can seed microbunching. Both CPU (`histogram_tsc_2d`, Numba JIT) and GPU (`histogram_tsc_2d_torch`, `scatter_add_`) implementations. Config: `deposition: tsc` under `particle_deposition:`. Default remains `cic`. Kernel is 3.3–4.1x slower in isolation; full-step overhead ranges from +6% (1M) to +95% (10M) since deposition is a small fraction of total step time at low N. |
+| 2026-05-01 | Memory profiling benchmarked (A100, CIC). Peak GPU memory: 303 MB (100k) → 3,050 MB (10M). ~280 MB fixed overhead from `torch.compile` buffers + CSR integration grids. Memory bottleneck shifts from CSR compute (low N) to apply_wakes (high N, temporary arrays scale with particle count). 10M particles uses 3.8% of A100 80 GB. |
+| 2026-05-01 | Updated performance tables with full benchmark results: 10–111x speedup over CPU across 100k–10M particles (previously reported 6.9x from early 1M-only test). |

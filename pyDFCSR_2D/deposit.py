@@ -119,6 +119,89 @@ def histogram_cic_2d_torch(q1, q2, w, nbins_1, bins_start_1, bins_end_1,
     return hist.reshape(nbins_1, nbins_2)
 
 
+@jit(nopython=True)
+def histogram_tsc_2d(q1, q2, w,
+                     nbins_1, bins_start_1, bins_end_1,
+                     nbins_2, bins_start_2, bins_end_2):
+    """2D histogram using Triangular Shaped Cloud (quadratic spline) weighting.
+    Each particle contributes to 3x3=9 cells, giving continuous first derivatives."""
+    bin_spacing_1 = (bins_end_1 - bins_start_1) / nbins_1
+    inv_spacing_1 = 1.0 / bin_spacing_1
+    bin_spacing_2 = (bins_end_2 - bins_start_2) / nbins_2
+    inv_spacing_2 = 1.0 / bin_spacing_2
+    n_ptcl = len(w)
+
+    hist_data = np.zeros((nbins_1, nbins_2), dtype=np.float64)
+
+    for i in range(n_ptcl):
+        u1 = (q1[i] - bins_start_1) * inv_spacing_1
+        u2 = (q2[i] - bins_start_2) * inv_spacing_2
+        i1_center = int(math.floor(u1 + 0.5))
+        i2_center = int(math.floor(u2 + 0.5))
+
+        for di in range(-1, 2):
+            ii = i1_center + di
+            if ii < 0 or ii >= nbins_1:
+                continue
+            d1 = abs(u1 - ii)
+            if d1 < 0.5:
+                s1 = 0.75 - d1 * d1
+            elif d1 < 1.5:
+                s1 = 0.5 * (1.5 - d1) * (1.5 - d1)
+            else:
+                s1 = 0.0
+
+            for dj in range(-1, 2):
+                jj = i2_center + dj
+                if jj < 0 or jj >= nbins_2:
+                    continue
+                d2 = abs(u2 - jj)
+                if d2 < 0.5:
+                    s2 = 0.75 - d2 * d2
+                elif d2 < 1.5:
+                    s2 = 0.5 * (1.5 - d2) * (1.5 - d2)
+                else:
+                    s2 = 0.0
+
+                hist_data[ii, jj] += w[i] * s1 * s2
+
+    return hist_data
+
+
+def histogram_tsc_2d_torch(q1, q2, w, nbins_1, bins_start_1, bins_end_1,
+                           nbins_2, bins_start_2, bins_end_2):
+    """GPU TSC 2D histogram via scatter_add_. Quadratic spline, 3x3=9 cells per particle."""
+    inv_spacing_1 = nbins_1 / (bins_end_1 - bins_start_1)
+    inv_spacing_2 = nbins_2 / (bins_end_2 - bins_start_2)
+
+    u1 = (q1 - bins_start_1) * inv_spacing_1
+    u2 = (q2 - bins_start_2) * inv_spacing_2
+    i1_center = torch.round(u1).to(torch.long)
+    i2_center = torch.round(u2).to(torch.long)
+
+    hist = torch.zeros(nbins_1 * nbins_2, device=q1.device, dtype=q1.dtype)
+
+    for di in range(-1, 2):
+        ii = i1_center + di
+        d1 = torch.abs(u1 - ii.to(q1.dtype))
+        s1 = torch.where(d1 < 0.5, 0.75 - d1 * d1,
+             torch.where(d1 < 1.5, 0.5 * (1.5 - d1) * (1.5 - d1),
+             torch.zeros_like(d1)))
+
+        for dj in range(-1, 2):
+            jj = i2_center + dj
+            d2 = torch.abs(u2 - jj.to(q2.dtype))
+            s2 = torch.where(d2 < 0.5, 0.75 - d2 * d2,
+                 torch.where(d2 < 1.5, 0.5 * (1.5 - d2) * (1.5 - d2),
+                 torch.zeros_like(d2)))
+
+            mask = (ii >= 0) & (ii < nbins_1) & (jj >= 0) & (jj < nbins_2)
+            idx = ii[mask] * nbins_2 + jj[mask]
+            hist.scatter_add_(0, idx, (w * s1 * s2)[mask])
+
+    return hist.reshape(nbins_1, nbins_2)
+
+
 def _savgol_conv1d(data_2d, kernel, axis):
     """Apply 1D convolution along axis 0 or 1 of a 2D tensor, matching savgol_filter behavior."""
     half = kernel.shape[0] // 2
@@ -208,7 +291,7 @@ class DF_tracker:
                          filter_order=0, filter_window=0,
                          velocity_threhold=5, upper_limit=None,
                          grid_mode='sigma', grid_percentile=0.9995,
-                         grid_padding=0.05):
+                         grid_padding=0.05, deposition='cic'):
         self.xbins = xbins
         self.zbins = zbins
         self.xlim = xlim
@@ -222,6 +305,7 @@ class DF_tracker:
         self.grid_mode = grid_mode
         self.grid_percentile = grid_percentile
         self.grid_padding = grid_padding
+        self.deposition = deposition
 
         if self.use_torch and filter_window > 0:
             coeffs = savgol_coeffs(filter_window, filter_order)
@@ -280,17 +364,18 @@ class DF_tracker:
 
         x_grids = np.linspace(x_start, x_end, xbins_t)
         z_grids = np.linspace(z_start, z_end, zbins_t)
-        density = histogram_cic_2d(q1=x, q2=z, w=np.ones(x.shape),
-                                   nbins_1=xbins_t, bins_start_1=x_start,
-                                   bins_end_1=x_end,
-                                   nbins_2=zbins_t, bins_start_2=z_start,
-                                   bins_end_2=z_end)
+        hist_fn = histogram_tsc_2d if self.deposition == 'tsc' else histogram_cic_2d
+        density = hist_fn(q1=x, q2=z, w=np.ones(x.shape),
+                          nbins_1=xbins_t, bins_start_1=x_start,
+                          bins_end_1=x_end,
+                          nbins_2=zbins_t, bins_start_2=z_start,
+                          bins_end_2=z_end)
 
-        vx = histogram_cic_2d(q1=x, q2=z, w=px,
-                              nbins_1=xbins_t, bins_start_1=x_start,
-                              bins_end_1=x_end,
-                              nbins_2=zbins_t, bins_start_2=z_start,
-                              bins_end_2=z_end)
+        vx = hist_fn(q1=x, q2=z, w=px,
+                     nbins_1=xbins_t, bins_start_1=x_start,
+                     bins_end_1=x_end,
+                     nbins_2=zbins_t, bins_start_2=z_start,
+                     bins_end_2=z_end)
         threshold = np.max(density) / self.velocity_threhold
         vx[density > threshold] /= density[density > threshold]
 
@@ -392,12 +477,13 @@ class DF_tracker:
         z_grids = torch.linspace(z_start, z_end, zbins_t, device=device, dtype=torch.float64)
 
         ones = torch.ones_like(x)
-        density = histogram_cic_2d_torch(x, z, ones,
-                                         xbins_t, x_start, x_end,
-                                         zbins_t, z_start, z_end)
-        vx = histogram_cic_2d_torch(x, z, px,
-                                     xbins_t, x_start, x_end,
-                                     zbins_t, z_start, z_end)
+        hist_fn = histogram_tsc_2d_torch if self.deposition == 'tsc' else histogram_cic_2d_torch
+        density = hist_fn(x, z, ones,
+                          xbins_t, x_start, x_end,
+                          zbins_t, z_start, z_end)
+        vx = hist_fn(x, z, px,
+                     xbins_t, x_start, x_end,
+                     zbins_t, z_start, z_end)
 
         threshold = density.max() / self.velocity_threhold
         high_mask = density > threshold
