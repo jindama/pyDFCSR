@@ -1,6 +1,6 @@
 # pyDFCSR
 
-Fast 2D/3D CSR simulation with Python
+Fast 2D/3D CSR simulation with Python. This is a feature branch for developping a GPU-native implementation of the code
 
 ## Installation
 
